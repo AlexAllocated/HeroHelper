@@ -779,6 +779,7 @@ function DB:ExportHash()
             if override.type    then cfg.type    = override.type    end
             if override.hp      then cfg.hp      = override.hp      end
             if override.seconds then cfg.seconds = override.seconds end
+            if override.conditions then cfg.conditions = override.conditions end
         end
         local enabled = not (override and override.enabled == false)
 

@@ -960,22 +960,16 @@ function Config:RefreshBossList()
         end
 
         local typeDD = MakeDropdown(row, 80, typeItems, function(value)
+            if value == "any" then
+                Config:ShowCompoundPopup(bossID)
+                return
+            end
             HH.chardb.bosses[bossID] = HH.chardb.bosses[bossID] or {}
             local override = HH.chardb.bosses[bossID]
             if value == "off" then
                 override.enabled    = false
                 override.type       = nil
                 override.conditions = nil
-            elseif value == "any" then
-                override.enabled    = true
-                override.type       = "any"
-                override.conditions = override.conditions or {}
-                -- Clear single-type fields when switching INTO compound.
-                override.hp      = nil
-                override.seconds = nil
-                -- Open the editor immediately so the user can populate
-                -- conditions. Cancel reverts the override if it was new.
-                Config:ShowCompoundPopup(bossID)
             else
                 override.enabled    = true
                 override.type       = value
@@ -1277,18 +1271,9 @@ function Config:ShowCompoundPopup(bossID)
 
     local f = CreateCompoundPopup()
     f._bossID = bossID
+    f:SetScript("OnHide", function() Config:RefreshBossList() end)
 
-    -- Snapshot the existing override BEFORE the popup runs so Cancel can
-    -- revert cleanly. The dropdown's onSelect already wrote
-    -- override.type = "any" with empty conditions; if we cancel and
-    -- conditions are still empty we should clear the partial override.
-    local override = HH.chardb.bosses[bossID]
-    f._wasNewCompound = (
-        override
-        and override.type == "any"
-        and (not override.conditions or #override.conditions == 0)
-    )
-
+    -- Changes stay in the popup until Save; Cancel leaves the saved override alone.
     -- Pre-fill from current effective config (default or existing override).
     local cfg = HH.Database:GetTriggerConfig(bossID) or boss.default
     local existing = (cfg and cfg.type == "any" and cfg.conditions) or {}
@@ -1340,16 +1325,9 @@ function Config:ShowCompoundPopup(bossID)
         o.seconds = nil
 
         f:Hide()
-        Config:RefreshBossList()
     end)
 
     f.btnCancel:SetScript("OnClick", function()
-        if f._wasNewCompound then
-            -- Drop the partial override so the dropdown reverts to the
-            -- database default on the next refresh.
-            HH.chardb.bosses[bossID] = nil
-            Config:RefreshBossList()
-        end
         f:Hide()
     end)
 
