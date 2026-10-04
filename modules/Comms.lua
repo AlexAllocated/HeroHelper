@@ -33,6 +33,15 @@
         HELLO:<priority>
             "I'm a HeroHelper user. My role priority is <priority>.
              My player name is implicit from the addon-message sender."
+        LOCK:<id>:<count>
+        SYNC:<id>:<count>:<owner>
+        MEMBER:<id>:<name>:<priority>  (one per roster entry)
+        LOCKED:<id>                  (commit the complete snapshot)
+        UNLOCK:<id>
+
+    A lock is applied only after all its members arrive. HELLO also requests
+    the current lock; peers can relay it to a reloading lock owner via SYNC.
+    Concurrent locks prefer the group leader, then assistants, then names.
 
     Priority numbers:
        1 = Primary    (elected when alive)
@@ -58,6 +67,18 @@ local roster = {}                  -- name -> priority
 -- lock is active. When non-nil, the election runs against this fixed
 -- snapshot — late joiners are not added until the next manual lock.
 local lockedRoster = nil           -- name -> priority OR nil
+local lockOwner, lockID
+local lockSequence = 0
+local incomingLocks = {}
+local outgoingLock, resendLock
+local LOCK_TIMEOUT = 10
+local MAX_ROSTER = 40
+
+local function ClearLock()
+    lockedRoster, lockOwner, lockID = nil, nil, nil
+    incomingLocks = {}
+    outgoingLock, resendLock = nil, nil
+end
 
 -- Debounce flag so a flurry of GROUP_ROSTER_UPDATE events coalesces
 -- into one HELLO broadcast.
@@ -84,6 +105,37 @@ local function NameLessThan(a, b)
     return (a:lower()) < (b:lower())
 end
 
+local function FindGroupUnit(name)
+    if not GetGroupChannel() or not name then return nil end
+    if BareName(UnitName("player")) == name then return "player" end
+    for _, prefix in ipairs({ "raid", "party" }) do
+        for i = 1, prefix == "raid" and 40 or 4 do
+            local unit = prefix .. i
+            if UnitExists(unit) and BareName(UnitName(unit)) == name then return unit end
+        end
+    end
+end
+
+local function Rank(name)
+    local unit = FindGroupUnit(name)
+    if not unit then return -1 end
+    if UnitIsGroupLeader and UnitIsGroupLeader(unit) then return 2 end
+    if UnitIsGroupAssistant and UnitIsGroupAssistant(unit) then return 1 end
+    return 0
+end
+
+local function CanControlLock(name)
+    if not FindGroupUnit(name) then return false end
+    if not lockOwner or name == lockOwner then return true end
+    local theirs, ours = Rank(name), Rank(lockOwner)
+    return theirs > ours or (theirs == ours and NameLessThan(name, lockOwner))
+end
+
+local function CanUnlock(name)
+    return FindGroupUnit(name)
+        and (name == lockOwner or Rank(name) > 0 or not FindGroupUnit(lockOwner))
+end
+
 -- Returns true if the named player is currently alive in the group.
 -- Scans player + raid + party slots. Returns false on miss so a player
 -- who left the group is implicitly excluded from the election.
@@ -105,7 +157,8 @@ local function IsPlayerAlive(name)
             end
         end
     else
-        local partyN = (GetNumPartyMembers and GetNumPartyMembers() or 0)
+        local partyN = (GetNumSubgroupMembers and GetNumSubgroupMembers())
+            or (GetNumPartyMembers and GetNumPartyMembers()) or 0
         for i = 1, partyN do
             local unit = "party" .. i
             if UnitExists(unit) and BareName(UnitName(unit)) == name then
@@ -135,6 +188,9 @@ end
 -- locked roster is intentionally NOT pruned — the order stands until
 -- /hh roster unlock.
 local function PruneLiveRoster()
+    if not GetGroupChannel() then
+        ClearLock()
+    end
     local me = BareName(UnitName("player"))
     local inGroup = {}
     if me then inGroup[me] = true end
@@ -150,7 +206,8 @@ local function PruneLiveRoster()
             end
         end
     else
-        local partyN = (GetNumPartyMembers and GetNumPartyMembers() or 0)
+        local partyN = (GetNumSubgroupMembers and GetNumSubgroupMembers())
+            or (GetNumPartyMembers and GetNumPartyMembers()) or 0
         for i = 1, partyN do
             local unit = "party" .. i
             if UnitExists(unit) then
@@ -238,6 +295,49 @@ function C:IsLocked()
     return lockedRoster ~= nil
 end
 
+function C:IsLockedMember(name)
+    name = BareName(name)
+    return lockedRoster and name and lockedRoster[name] ~= nil and FindGroupUnit(name) ~= nil
+end
+
+local function SendLock()
+    if not lockedRoster then return end
+    local channel, id = GetGroupChannel(), lockID
+    if not channel then return end
+    if outgoingLock then
+        resendLock = true -- a client may have joined after the first chunk
+        return
+    end
+    local transfer = { id = id, owner = lockOwner }
+    outgoingLock = transfer
+    local function StillCurrent()
+        return outgoingLock == transfer and lockID == id and lockOwner == transfer.owner
+            and GetGroupChannel() == channel
+    end
+    local ordered = SortedRoster(lockedRoster)
+    if lockOwner == BareName(UnitName("player")) then
+        SendAddonMsg("LOCK:" .. id .. ":" .. #ordered, channel)
+    else
+        SendAddonMsg("SYNC:" .. id .. ":" .. #ordered .. ":" .. lockOwner, channel)
+    end
+    for i, entry in ipairs(ordered) do
+        local message = "MEMBER:" .. id .. ":" .. entry.name .. ":" .. entry.priority
+        C_Timer.After(i * 0.1, function()
+            if StillCurrent() then SendAddonMsg(message, channel) end
+        end)
+    end
+    C_Timer.After((#ordered + 1) * 0.1, function()
+        if StillCurrent() then SendAddonMsg("LOCKED:" .. id, channel) end
+        if outgoingLock == transfer then
+            outgoingLock = nil
+            if resendLock then
+                resendLock = nil
+                SendLock()
+            end
+        end
+    end)
+end
+
 -- ============================================================================
 -- Chat announcement
 -- ============================================================================
@@ -297,6 +397,10 @@ function C:Lock()
     end
 
     lockedRoster = snapshot
+    lockOwner = BareName(UnitName("player"))
+    lockSequence = lockSequence + 1
+    lockID = math.floor(GetTime() * 1000) .. "-" .. lockSequence
+    SendLock()
     HH:Debug(("Coordinate: election LOCKED with %d HeroHelper user(s)"):format(count))
 
     -- Only the user who ran /hh roster lock posts the order. The locking
@@ -309,7 +413,10 @@ function C:Unlock()
     if not lockedRoster then
         return false, "not currently locked"
     end
-    lockedRoster = nil
+    local me = BareName(UnitName("player"))
+    if not CanUnlock(me) then return false, "ask the player who locked the order or a group leader/assistant to unlock it" end
+    SendAddonMsg("UNLOCK:" .. lockID, GetGroupChannel())
+    ClearLock()
     HH:Debug("Coordinate: election UNLOCKED")
     return true
 end
@@ -355,6 +462,18 @@ local function HandleHello(senderName, priority)
     if prev ~= priority then
         HH:Debug(("Coordinate: HELLO from %s (priority=%d)"):format(senderName, priority))
     end
+    if lockOwner == me then
+        SendLock()
+    elseif lockedRoster and (senderName == lockOwner or not FindGroupUnit(lockOwner)) then
+        -- One peer answers if the owner reloads or leaves. Having every
+        -- shaman relay a full roster would flood the addon channel.
+        for _, entry in ipairs(SortedRoster(roster)) do
+            if entry.name ~= lockOwner and entry.name ~= senderName and FindGroupUnit(entry.name) then
+                if entry.name == me then SendLock() end
+                break
+            end
+        end
+    end
 end
 
 -- ============================================================================
@@ -368,16 +487,73 @@ function C:Initialize()
         pcall(RegisterAddonMessagePrefix, ADDON_PREFIX)
     end
 
-    HH.Events:On("CHAT_MSG_ADDON", function(prefix, message, _channel, sender)
+    HH.Events:On("CHAT_MSG_ADDON", function(prefix, message, channel, sender)
         if prefix ~= ADDON_PREFIX or not message then return end
 
         local senderName = BareName(sender)
-        if not senderName then return end
+        if not senderName or senderName == BareName(UnitName("player")) then return end
+        if channel ~= GetGroupChannel() or not FindGroupUnit(senderName) then return end
 
         local kind, payload = message:match("^(%a+):(.*)$")
         if kind == "HELLO" then
             local priority = tonumber(payload) or PRIORITY_AUTO
+            if priority < 1 or priority > PRIORITY_AUTO or priority ~= math.floor(priority) then return end
             HandleHello(senderName, priority)
+        elseif kind == "LOCK" or kind == "SYNC" then
+            local id, count = payload:match("^([%d%-]+):(%d+)$")
+            local owner = senderName
+            if kind == "SYNC" then
+                if lockedRoster then return end -- relays cannot replace an established lock
+                id, count, owner = payload:match("^([%d%-]+):(%d+):([^:%s]+)$")
+            end
+            count = tonumber(count)
+            if id and #id <= 32 and count and count >= 1 and count <= MAX_ROSTER
+                and owner and #owner <= 64 and (kind == "SYNC" or CanControlLock(senderName)) then
+                incomingLocks[senderName] = {
+                    id = id, owner = owner, relay = kind == "SYNC",
+                    count = count, members = {}, at = GetTime(),
+                }
+            end
+        elseif kind == "MEMBER" then
+            local id, name, priority = payload:match("^([%d%-]+):([^:]+):(%d+)$")
+            priority = tonumber(priority)
+            local pending = incomingLocks[senderName]
+            if pending and pending.id == id and GetTime() - pending.at < LOCK_TIMEOUT then
+                -- A frozen roster can include someone who has since left. The
+                -- election checks current membership, so keep their place here.
+                if not name or #name > 64 or name:find("%s")
+                    or not priority or priority < 1 or priority > PRIORITY_AUTO
+                    or pending.members[name] then
+                    pending.invalid = true
+                else
+                    pending.members[name] = priority
+                end
+            end
+        elseif kind == "LOCKED" then
+            local pending = incomingLocks[senderName]
+            incomingLocks[senderName] = nil
+            local allowed = pending and ((pending.relay and not lockedRoster)
+                or (not pending.relay and CanControlLock(senderName)))
+            if allowed and pending.id == payload and not pending.invalid
+                and GetTime() - pending.at < LOCK_TIMEOUT then
+                local count = 0
+                for _ in pairs(pending.members) do count = count + 1 end
+                if count == pending.count then
+                    lockedRoster, lockOwner, lockID = pending.members, pending.owner, pending.id
+                    for name, priority in pairs(lockedRoster) do
+                        if not roster[name] and FindGroupUnit(name) then roster[name] = priority end
+                    end
+                end
+            end
+        elseif kind == "UNLOCK" then
+            -- Also discard an incomplete transfer if the owner unlocks before
+            -- its final chunk reaches this client.
+            for source, pending in pairs(incomingLocks) do
+                if pending.id == payload and (pending.owner == senderName or Rank(senderName) > 0) then
+                    incomingLocks[source] = nil
+                end
+            end
+            if lockID == payload and CanUnlock(senderName) then ClearLock() end
         end
     end)
 

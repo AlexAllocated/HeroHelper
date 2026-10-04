@@ -56,7 +56,7 @@ Click **Export** to copy your settings as a share string and send them to the re
 
 ### Coordinating with other shamans
 
-By default, every HeroHelper-using shaman fires their own reminder. When you want to lock in who Heroes, someone types `/hh roster lock` — that freezes the current roster, announces the resolved order to group chat, and from then on only the elected shaman's reminder fires. If that shaman dies mid-fight, the reminder automatically jumps to the next-priority alive shaman (Primary > Secondary > Backup).
+By default, every HeroHelper-using shaman fires their own reminder. When you want to lock in who Heroes, someone types `/hh roster lock` — that freezes the current roster, announces the resolved order to group chat, and from then on only the elected shaman's reminder fires. If that shaman dies before casting, the reminder automatically jumps to the next-priority alive shaman (Primary > Secondary > Backup).
 
 Each shaman sets their **role** in the General tab before the lock:
 
@@ -65,7 +65,7 @@ Each shaman sets their **role** in the General tab before the lock:
 - **Backup** — elected if Primary and Secondary are dead.
 - **Auto** — no explicit role; alphabetical tiebreak only.
 
-Type `/hh roster unlock` to drop the lock and go back to everyone firing independently. `/hh roster` on its own shows the current state — locked or live, roster contents, and the current elected winner.
+The player who locked the order, or a group leader/assistant, can type `/hh roster unlock` to go back to everyone firing independently. Locks are shared with the other clients and cleared when you leave the group; everyone needs a version that supports shared locks. `/hh roster` on its own shows the current state — locked or live, roster contents, and the current elected winner.
 
 ---
 
