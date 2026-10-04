@@ -30,6 +30,12 @@ local T = HH.Triggers
 -- frame. 0.25s gives us responsive triggering without measurable cost.
 local HP_POLL_INTERVAL = 0.25
 local hpPollTicker
+local retryTicker, pendingReason, armedBoss
+
+local function ClearPending()
+    pendingReason = nil
+    if retryTicker then retryTicker:Cancel(); retryTicker = nil end
+end
 
 -- List of in-flight one-shot timers for "time" trigger conditions. Compound
 -- triggers (type = "any") can arm multiple time conditions in parallel, so
@@ -73,6 +79,7 @@ local function IsReady()
     if not HH:IsActive() then return false end
     if not HH.State.isShaman then return false end
     if not HH.State.inCombat then return false end
+    if UnitIsDeadOrGhost("player") then return false end
     if not HH.State.currentBossID then return false end
     if HH.State.triggered then return false end
     if HH:HasExhaustionDebuff() then return false end
@@ -82,29 +89,35 @@ end
 
 -- Try to fire the reminder based on the trigger config for the current boss.
 --
--- The latch (HH.State.triggered = true) happens immediately so any other
--- trigger condition that satisfies during this pull (HP poll tick, second
--- BOSS_PULL, time timer) treats the pull as already-handled and silently
--- no-ops on its own IsReady gate.
---
--- Multi-shaman coordination is handled by HH.Comms:AmIElectedWinner: the
--- elected winner (per the locked or live roster) is the only one whose
--- TryFire actually shows the reminder. Non-winners latch their own
--- triggered state and stay completely silent — no popup, no sound, nothing.
--- See modules/Comms.lua for the election protocol and lock semantics.
+-- Suppression is temporary: a cooldown can finish or the elected shaman can die.
 local function TryFire(reason)
-    if not IsReady() then return end
-
-    HH.State.triggered = true
+    if not IsReady() then return false end
     local bossID = HH.State.currentBossID
 
     if HH.Comms and HH.Comms.AmIElectedWinner and not HH.Comms:AmIElectedWinner() then
-        HH:Debug("TRIGGER SUPPRESSED: another shaman is the elected winner")
-        return
+        return false
     end
 
+    HH.State.triggered = true
+    ClearPending()
+    T:StopHPPoll()
+    CancelAllTimeTriggers()
     HH:Debug("TRIGGER FIRED: " .. tostring(reason))
     HH.Events:Fire("HEROHELPER_TRIGGER", bossID, reason)
+    return true
+end
+
+local function ConditionReached(reason)
+    if HH.State.triggered then return end
+    pendingReason = pendingReason or reason
+    if TryFire(pendingReason) or retryTicker then return end
+    retryTicker = C_Timer.NewTicker(HP_POLL_INTERVAL, function()
+        if not HH.State.inCombat or not HH.State.currentBossID or HH.State.triggered then
+            ClearPending()
+        else
+            TryFire(pendingReason)
+        end
+    end)
 end
 
 -- ============================================================================
@@ -123,7 +136,7 @@ local function ArmCondition(cond)
     if cond.type == "skip" then return end
 
     if cond.type == "pull" then
-        TryFire("pull")
+        ConditionReached("pull")
     elseif cond.type == "hp" then
         T:StartHPPoll(cond.hp)
     elseif cond.type == "time" then
@@ -139,7 +152,7 @@ local function ArmCondition(cond)
                 end
             end
             if HH.State.currentBossID == pullBossID and HH.State.inCombat then
-                TryFire("time +" .. seconds .. "s")
+                ConditionReached("time +" .. seconds .. "s")
             end
         end)
         table.insert(activeTimeTimers, timer)
@@ -156,25 +169,31 @@ end
 -- Detection:ScanUnits early-returns because currentBossID is already
 -- locked, so BOSS_PULL never re-fires — the trigger window is lost.
 --
--- This function is idempotent: HH.State.triggered latches once we fire,
--- so calling it twice is safe. Both BOSS_PULL and COMBAT_START call it
--- and whichever happens second produces the actual fire.
+-- Arm once both the boss and combat are known. The second event must not
+-- restart the timers, even when no reminder has fired yet.
 local function EvaluatePullTrigger()
-    if not HH.State.currentBossID then return end
+    if not HH.State.currentBossID or not HH.State.inCombat then return end
+    if armedBoss == HH.State.currentBossID then return end
 
     local cfg = HH.Database:GetTriggerConfig(HH.State.currentBossID)
     if not cfg then return end
+    armedBoss = HH.State.currentBossID
+    HH.State.pullTime = GetTime()
 
     -- Compound triggers fan out into all subconditions in parallel; single
     -- triggers go through the same loop as a one-element list.
     for cond in IterConditions(cfg) do
         ArmCondition(cond)
+        if HH.State.triggered then break end
     end
 end
 
 -- BOSS_PULL handler. Resets per-pull state and runs the trigger evaluator.
 local function OnBossPull(bossID)
     HH.State.triggered = false
+    armedBoss = nil
+    ClearPending()
+    T:StopHPPoll()
     CancelAllTimeTriggers() -- new pull invalidates any in-flight time timers
     EvaluatePullTrigger()
 end
@@ -192,7 +211,7 @@ function T:StartHPPoll(threshold)
         end
         local hp = HH.Detection:GetCurrentBossHPPct()
         if hp and hp <= threshold then
-            TryFire("hp " .. math.floor(hp) .. "%")
+            ConditionReached("hp " .. math.floor(hp) .. "%")
             T:StopHPPoll()
         end
     end)
@@ -389,7 +408,18 @@ function T:Initialize()
     end)
     HH.Events:On("COMBAT_END", function()
         HH.State.triggered = false
+        armedBoss = nil
+        ClearPending()
         T:StopHPPoll()
         CancelAllTimeTriggers()
+    end)
+    HH.Events:On("CLEU", function(_, event, _, _, sourceName, _, _, _, _, _, _, spellID)
+        if event == "SPELL_CAST_SUCCESS" and (spellID == 2825 or spellID == 32182)
+            and HH.Comms and HH.Comms.IsLockedMember and HH.Comms:IsLockedMember(sourceName) then
+            HH.State.triggered = true
+            ClearPending()
+            T:StopHPPoll()
+            CancelAllTimeTriggers()
+        end
     end)
 end
