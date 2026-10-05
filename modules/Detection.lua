@@ -114,12 +114,9 @@ function Detection:ScanUnits()
             end
 
             if id then
-                -- Dungeon bosses require the unit to be in combat before we
-                -- lock in. Without this check, pulling trash near an idle
-                -- dungeon boss causes a false BOSS_PULL because the scan
-                -- picks up the nearby boss via raid/party targets.
-                local boss = HH.Database:Get(id)
-                if boss and boss.isDungeon and not UnitAffectingCombat(unit) then
+                -- An idle raid or dungeon boss may be targeted during a trash
+                -- pull. Only lock in once the boss itself is engaged.
+                if not UnitAffectingCombat(unit) then
                     -- Skip: boss is in the database but not yet engaged.
                 else
                     local displayName = UnitName(unit)
